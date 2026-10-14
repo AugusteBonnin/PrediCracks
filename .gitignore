@@ -218,3 +218,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PrediCracks datasets and generated artifacts
+data/
+images/
+seeds/
+predictions_*/
+*.h5
+*.csv
+*.mp4
+*.png
+best_*.json
+TRAINING_STATE.md

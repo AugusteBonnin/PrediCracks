@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""Train a ConvLSTM to predict the next crack image in a time series."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+from pathlib import Path
+
+import numpy as np
+
+try:
+    # This must happen before importing standalone Keras.
+    import plaidml.keras
+
+    plaidml.keras.install_backend()
+    import keras
+    from keras import backend as K
+    from keras import layers
+except ImportError as exc:
+    raise SystemExit(
+        "PlaidML/Keras is required. Activate the environment containing "
+        "plaidml-keras before launching this script."
+    ) from exc
+
+
+IMAGE_SHAPE = (256, 256)
+
+
+def load_dataset(directory: Path) -> tuple[np.ndarray, np.ndarray]:
+    files = sorted(directory.glob("*.data"))
+    if not files:
+        raise ValueError(f"No .data files found in {directory}")
+
+    times = np.empty(len(files), dtype=np.float32)
+    images = np.empty((len(files), *IMAGE_SHAPE, 1), dtype=np.float32)
+    expected_size = 1 + np.prod(IMAGE_SHAPE)
+    for index, path in enumerate(files):
+        data = np.fromfile(path, dtype=np.float32)
+        if data.size != expected_size:
+            raise ValueError(
+                f"{path.name}: expected {expected_size} float32 values, got {data.size}"
+            )
+        times[index] = data[0]
+        images[index, ..., 0] = data[1:].reshape(IMAGE_SHAPE)
+
+    order = np.argsort(times, kind="stable")
+    times, images = times[order], images[order]
+    if np.any(np.diff(times) <= 0):
+        raise ValueError("Times must be strictly increasing")
+    return times, images
+
+
+def transform_spatial(array: np.ndarray, code: int) -> np.ndarray:
+    """Apply one of the eight square symmetries to all frames identically."""
+    rotation, flip = code % 4, code // 4
+    result = np.rot90(array, k=rotation, axes=(-3, -2))
+    if flip:
+        result = np.flip(result, axis=-2)
+    return np.ascontiguousarray(result)
+
+
+def make_crack_strength(images: np.ndarray, contrast: float = 0.25) -> np.ndarray:
+    """Convert grayscale frames to temporally denoised crack-strength maps."""
+    backgrounds = np.percentile(images[..., 0], 85, axis=(1, 2))
+    strength = np.clip(
+        (backgrounds[:, None, None] - images[..., 0]) / contrast, 0.0, 1.0
+    ).astype(np.float32)
+    denoised = np.empty_like(strength)
+    for index in range(len(strength)):
+        start, stop = max(0, index - 2), min(len(strength), index + 3)
+        denoised[index] = np.median(strength[start:stop], axis=0)
+    return denoised[..., None]
+
+
+class WindowSequence(keras.utils.Sequence):
+    def __init__(
+        self,
+        times: np.ndarray,
+        images: np.ndarray,
+        samples: np.ndarray,
+        sequence_length: int,
+        batch_size: int,
+        delta_scale: float,
+        augment: bool,
+        shuffle: bool,
+        seed: int,
+        target_mode: str = "scaled_delta",
+    ):
+        self.times = times
+        self.images = images
+        # Each sample is (last input frame index, target frame index).
+        self.samples = np.asarray(samples, dtype=np.int64)
+        self.sequence_length = sequence_length
+        self.batch_size = batch_size
+        self.delta_scale = delta_scale
+        self.augment = augment
+        self.shuffle = shuffle
+        self.rng = np.random.default_rng(seed)
+        self.target_mode = target_mode
+        self.on_epoch_end()
+
+    def __len__(self) -> int:
+        return int(np.ceil(len(self.samples) / self.batch_size))
+
+    def __getitem__(self, batch_index: int):
+        selected = self.samples[
+            batch_index * self.batch_size : (batch_index + 1) * self.batch_size
+        ]
+        batch_size = len(selected)
+        sequence = np.empty(
+            (batch_size, self.sequence_length, *IMAGE_SHAPE, 3), dtype=np.float32
+        )
+        target_delta = np.empty((batch_size, *IMAGE_SHAPE, 1), dtype=np.float32)
+
+        for row, (input_end, target_index) in enumerate(selected):
+            start = input_end - self.sequence_length + 1
+            frames = self.images[start:input_end + 1]
+            output = self.images[target_index]
+            code = int(self.rng.integers(8)) if self.augment else 0
+            frames = transform_spatial(frames, code)
+            output = transform_spatial(output, code)
+
+            # A time map lets every ConvLSTM cell see the absolute normalized time.
+            time_maps = np.broadcast_to(
+                self.times[start:input_end + 1, None, None, None],
+                (*frames.shape[:-1], 1),
+            )
+            target_time_maps = np.full(
+                (*frames.shape[:-1], 1), self.times[target_index], dtype=np.float32
+            )
+            sequence[row] = np.concatenate(
+                (frames, time_maps, target_time_maps), axis=-1
+            )
+            if self.target_mode == "crack_strength":
+                target_delta[row] = output
+            else:
+                target_delta[row] = (output - frames[-1]) / self.delta_scale
+
+        return {"sequence": sequence}, target_delta
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            self.rng.shuffle(self.samples)
+
+
+def make_samples(first_target: int, last_target: int, sequence_length: int,
+                 max_horizon: int) -> np.ndarray:
+    samples = []
+    for target_index in range(first_target, last_target):
+        for horizon in range(1, max_horizon + 1):
+            input_end = target_index - horizon
+            if input_end - sequence_length + 1 >= 0:
+                samples.append((input_end, target_index))
+    return np.asarray(samples, dtype=np.int64)
+
+
+def weighted_delta_loss(y_true, y_pred):
+    """Favor localized crack growth instead of the dominant static background."""
+    magnitude = K.minimum(K.abs(y_true), 2.0)
+    darkening = K.minimum(K.relu(-y_true), 2.0)
+    pixel_loss = (1.0 + 25.0 * magnitude + 10.0 * darkening) * K.square(
+        y_pred - y_true
+    )
+
+    # Matching spatial derivatives makes thin crack fronts matter even though
+    # they occupy only a small fraction of the image.
+    true_dx = y_true[:, :, 1:, :] - y_true[:, :, :-1, :]
+    pred_dx = y_pred[:, :, 1:, :] - y_pred[:, :, :-1, :]
+    true_dy = y_true[:, 1:, :, :] - y_true[:, :-1, :, :]
+    pred_dy = y_pred[:, 1:, :, :] - y_pred[:, :-1, :, :]
+    gradient_loss = K.mean(K.abs(pred_dx - true_dx)) + K.mean(
+        K.abs(pred_dy - true_dy)
+    )
+    return K.mean(pixel_loss) + 0.5 * gradient_loss
+
+
+def crack_structure_loss(y_true, y_pred):
+    """Fit crack interiors and, especially, their thin spatial boundaries."""
+    pixel_loss = (1.0 + 6.0 * y_true) * K.square(y_pred - y_true)
+    true_dx = y_true[:, :, 1:, :] - y_true[:, :, :-1, :]
+    pred_dx = y_pred[:, :, 1:, :] - y_pred[:, :, :-1, :]
+    true_dy = y_true[:, 1:, :, :] - y_true[:, :-1, :, :]
+    pred_dy = y_pred[:, 1:, :, :] - y_pred[:, :-1, :, :]
+    gradient_loss = K.mean(K.abs(pred_dx - true_dx)) + K.mean(
+        K.abs(pred_dy - true_dy)
+    )
+    return K.mean(pixel_loss) + gradient_loss
+
+
+def build_model(sequence_length: int, learning_rate: float,
+                target_mode: str = "scaled_delta", base_filters: int = 16) -> keras.Model:
+    sequence = layers.Input((sequence_length, *IMAGE_SHAPE, 3), name="sequence")
+
+    x = layers.TimeDistributed(
+        layers.Conv2D(base_filters, 5, padding="same", activation="relu")
+    )(sequence)
+    x = layers.TimeDistributed(layers.MaxPooling2D(2))(x)
+    x = layers.TimeDistributed(
+        layers.Conv2D(2 * base_filters, 3, padding="same", activation="relu")
+    )(x)
+    x = layers.TimeDistributed(layers.MaxPooling2D(2))(x)
+    x = layers.ConvLSTM2D(4 * base_filters, 3, padding="same", return_sequences=False)(x)
+    x = layers.Conv2D(4 * base_filters, 3, padding="same", activation="relu")(x)
+    x = layers.UpSampling2D(2)(x)
+    x = layers.Conv2D(2 * base_filters, 3, padding="same", activation="relu")(x)
+    x = layers.UpSampling2D(2)(x)
+    x = layers.Conv2D(base_filters, 3, padding="same", activation="relu")(x)
+    activation = "sigmoid" if target_mode == "crack_strength" else None
+    delta = layers.Conv2D(
+        1, 3, padding="same", activation=activation, name="delta_prediction"
+    )(x)
+
+    model = keras.models.Model(sequence, delta, name="crack_delta_convlstm")
+    model.compile(
+        optimizer=keras.optimizers.Adam(lr=learning_rate),
+        loss=crack_structure_loss if target_mode == "crack_strength" else weighted_delta_loss,
+        metrics=["mean_absolute_error"],
+    )
+    return model
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--data-dir", type=Path,
+        default=Path(__file__).resolve().parent / "data",
+    )
+    parser.add_argument("--output", type=Path,
+                        default=Path("best_convlstm_delta.h5"))
+    parser.add_argument(
+        "--initial-weights", type=Path, default=None,
+        help="Resume from weights saved by an earlier training process.",
+    )
+    parser.add_argument("--sequence-length", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument(
+        "--initial-epoch", type=int, default=0,
+        help="Number of already completed epochs (used for resumed run labels).",
+    )
+    parser.add_argument("--validation-fraction", type=float, default=0.2)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--patience", type=int, default=12)
+    parser.add_argument("--max-horizon", type=int, default=5)
+    parser.add_argument("--delta-scale", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=279)
+    parser.add_argument("--no-augmentation", action="store_true")
+    parser.add_argument("--target-mode", choices=("scaled_delta", "crack_strength"),
+                        default="scaled_delta")
+    parser.add_argument("--base-filters", type=int, default=16)
+    parser.add_argument("--crack-contrast", type=float, default=0.25)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.sequence_length < 2:
+        raise ValueError("--sequence-length must be at least 2")
+    if not 0.0 < args.validation_fraction < 0.5:
+        raise ValueError("--validation-fraction must be between 0 and 0.5")
+    if args.max_horizon < 1 or args.delta_scale <= 0.0:
+        raise ValueError("--max-horizon and --delta-scale must be positive")
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    times, images = load_dataset(args.data_dir)
+    if args.target_mode == "crack_strength":
+        images = make_crack_strength(images, args.crack_contrast)
+
+    # Split chronologically by target frame. Validation may use preceding training
+    # frames as context, but no validation target can leak into training.
+    split = int(len(images) * (1.0 - args.validation_fraction))
+    train_samples = make_samples(
+        args.sequence_length, split, args.sequence_length, args.max_horizon
+    )
+    val_samples = make_samples(
+        split, len(images), args.sequence_length, args.max_horizon
+    )
+    if not len(train_samples) or not len(val_samples):
+        raise ValueError("Dataset is too small for the requested split/window")
+
+    train_data = WindowSequence(
+        times, images, train_samples, args.sequence_length, args.batch_size,
+        args.delta_scale, not args.no_augmentation, True, args.seed,
+        args.target_mode,
+    )
+    val_data = WindowSequence(
+        times, images, val_samples, args.sequence_length, args.batch_size,
+        args.delta_scale, False, False, args.seed,
+        args.target_mode,
+    )
+    model = build_model(args.sequence_length, args.learning_rate,
+                        args.target_mode, args.base_filters)
+    if args.initial_weights is not None:
+        if not args.initial_weights.exists():
+            raise ValueError(f"Initial weights not found: {args.initial_weights}")
+        # Loading weights instead of the complete compiled model avoids
+        # deserializing the custom loss and stale optimizer/GPU state.
+        model.load_weights(str(args.initial_weights))
+        print(f"Loaded initial weights from {args.initial_weights}")
+    model.summary()
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path = args.output.with_suffix(".json")
+    metadata_path.write_text(json.dumps({
+        "sequence_length": args.sequence_length,
+        "image_shape": list(IMAGE_SHAPE),
+        "training_frames": int(split),
+        "validation_frames": int(len(images) - split),
+        "training_samples": int(len(train_samples)),
+        "validation_samples": int(len(val_samples)),
+        "max_horizon": args.max_horizon,
+        "output_mode": args.target_mode,
+        "base_filters": args.base_filters,
+        "crack_contrast": args.crack_contrast,
+        "delta_scale": args.delta_scale,
+        "input_channels": 3,
+        "median_delta_t": float(np.median(np.diff(times))),
+        "pixel_min": float(images.min()),
+        "pixel_max": float(images.max()),
+    }, indent=2) + "\n")
+
+    callbacks = [
+        keras.callbacks.ModelCheckpoint(
+            str(args.output), monitor="val_loss", save_best_only=True, verbose=1
+        ),
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=args.patience,
+            restore_best_weights=True, verbose=1,
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=max(3, args.patience // 3),
+            min_lr=1e-6, verbose=1,
+        ),
+        keras.callbacks.CSVLogger(str(args.output.with_suffix(".csv"))),
+    ]
+    model.fit_generator(
+        train_data,
+        validation_data=val_data,
+        initial_epoch=args.initial_epoch,
+        epochs=args.initial_epoch + args.epochs,
+        callbacks=callbacks,
+        workers=1,
+        use_multiprocessing=False,
+    )
+
+
+if __name__ == "__main__":
+    main()

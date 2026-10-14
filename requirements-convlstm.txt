@@ -1,0 +1,5 @@
+# Versions corresponding to the historical PlaidML/Keras stack.
+numpy<1.24
+Pillow
+Keras==2.2.4
+plaidml-keras==0.7.0
