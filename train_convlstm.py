@@ -205,6 +205,23 @@ def residual_block(x, filters: int, time_distributed: bool = False):
     return layers.Activation("relu")(layers.Add()([x, shortcut]))
 
 
+def dilated_spatial_pyramid(x, filters: int):
+    """Aggregate spatial context over four receptive-field sizes."""
+    branch_filters = max(filters // 4, 1)
+    branches = [
+        layers.Conv2D(
+            branch_filters, 3, padding="same", dilation_rate=rate,
+            activation="relu",
+        )(x)
+        for rate in (1, 2, 4, 8)
+    ]
+    x = layers.Concatenate(name="dilated_context")(branches)
+    return layers.Conv2D(
+        filters, 1, padding="same", activation="relu",
+        name="context_projection",
+    )(x)
+
+
 def build_model(sequence_length: int, learning_rate: float,
                 target_mode: str = "scaled_delta", base_filters: int = 16) -> keras.Model:
     sequence = layers.Input((sequence_length, *IMAGE_SHAPE, 3), name="sequence")
@@ -218,6 +235,7 @@ def build_model(sequence_length: int, learning_rate: float,
     x = layers.ConvLSTM2D(
         8 * base_filters, 3, padding="same", return_sequences=False
     )(x)
+    x = dilated_spatial_pyramid(x, 8 * base_filters)
     x = residual_block(x, 8 * base_filters)
     x = layers.UpSampling2D(2)(x)
     x = residual_block(x, 4 * base_filters)
