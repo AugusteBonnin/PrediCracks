@@ -193,7 +193,7 @@ def soft_dilate(image):
     )
 
 
-def soft_skeleton(image, iterations: int = 10):
+def soft_skeleton(image, iterations: int = 3):
     """Extract a differentiable centerline with iterative morphology."""
     opened = soft_dilate(soft_erode(image))
     skeleton = K.relu(image - opened)
