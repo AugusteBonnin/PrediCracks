@@ -189,32 +189,42 @@ def crack_structure_loss(y_true, y_pred):
     return K.mean(pixel_loss) + gradient_loss
 
 
+def residual_block(x, filters: int, time_distributed: bool = False):
+    """Two convolutions with an identity or projected residual shortcut."""
+    def convolution(kernel_size: int, activation=None):
+        layer = layers.Conv2D(
+            filters, kernel_size, padding="same", activation=activation
+        )
+        return layers.TimeDistributed(layer) if time_distributed else layer
+
+    shortcut = x
+    x = convolution(3, activation="relu")(x)
+    x = convolution(3)(x)
+    if K.int_shape(shortcut)[-1] != filters:
+        shortcut = convolution(1)(shortcut)
+    return layers.Activation("relu")(layers.Add()([x, shortcut]))
+
+
 def build_model(sequence_length: int, learning_rate: float,
                 target_mode: str = "scaled_delta", base_filters: int = 16) -> keras.Model:
     sequence = layers.Input((sequence_length, *IMAGE_SHAPE, 3), name="sequence")
 
-    x = layers.TimeDistributed(
-        layers.Conv2D(base_filters, 5, padding="same", activation="relu")
-    )(sequence)
+    x = residual_block(sequence, base_filters, time_distributed=True)
     x = layers.TimeDistributed(layers.MaxPooling2D(2))(x)
-    x = layers.TimeDistributed(
-        layers.Conv2D(2 * base_filters, 3, padding="same", activation="relu")
-    )(x)
+    x = residual_block(x, 2 * base_filters, time_distributed=True)
     x = layers.TimeDistributed(layers.MaxPooling2D(2))(x)
-    x = layers.TimeDistributed(
-        layers.Conv2D(4 * base_filters, 3, padding="same", activation="relu")
-    )(x)
+    x = residual_block(x, 4 * base_filters, time_distributed=True)
     x = layers.TimeDistributed(layers.MaxPooling2D(2))(x)
     x = layers.ConvLSTM2D(
         8 * base_filters, 3, padding="same", return_sequences=False
     )(x)
-    x = layers.Conv2D(8 * base_filters, 3, padding="same", activation="relu")(x)
+    x = residual_block(x, 8 * base_filters)
     x = layers.UpSampling2D(2)(x)
-    x = layers.Conv2D(4 * base_filters, 3, padding="same", activation="relu")(x)
+    x = residual_block(x, 4 * base_filters)
     x = layers.UpSampling2D(2)(x)
-    x = layers.Conv2D(2 * base_filters, 3, padding="same", activation="relu")(x)
+    x = residual_block(x, 2 * base_filters)
     x = layers.UpSampling2D(2)(x)
-    x = layers.Conv2D(base_filters, 3, padding="same", activation="relu")(x)
+    x = residual_block(x, base_filters)
     activation = "sigmoid" if target_mode == "crack_strength" else None
     delta = layers.Conv2D(
         1, 3, padding="same", activation=activation, name="delta_prediction"
