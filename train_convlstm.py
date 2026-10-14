@@ -201,7 +201,15 @@ def build_model(sequence_length: int, learning_rate: float,
         layers.Conv2D(2 * base_filters, 3, padding="same", activation="relu")
     )(x)
     x = layers.TimeDistributed(layers.MaxPooling2D(2))(x)
-    x = layers.ConvLSTM2D(4 * base_filters, 3, padding="same", return_sequences=False)(x)
+    x = layers.TimeDistributed(
+        layers.Conv2D(4 * base_filters, 3, padding="same", activation="relu")
+    )(x)
+    x = layers.TimeDistributed(layers.MaxPooling2D(2))(x)
+    x = layers.ConvLSTM2D(
+        8 * base_filters, 3, padding="same", return_sequences=False
+    )(x)
+    x = layers.Conv2D(8 * base_filters, 3, padding="same", activation="relu")(x)
+    x = layers.UpSampling2D(2)(x)
     x = layers.Conv2D(4 * base_filters, 3, padding="same", activation="relu")(x)
     x = layers.UpSampling2D(2)(x)
     x = layers.Conv2D(2 * base_filters, 3, padding="same", activation="relu")(x)
@@ -249,7 +257,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-augmentation", action="store_true")
     parser.add_argument("--target-mode", choices=("scaled_delta", "crack_strength"),
                         default="scaled_delta")
-    parser.add_argument("--base-filters", type=int, default=16)
+    parser.add_argument("--base-filters", type=int, default=8)
     parser.add_argument("--crack-contrast", type=float, default=0.25)
     return parser.parse_args()
 
