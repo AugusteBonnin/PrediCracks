@@ -274,14 +274,14 @@ def residual_block(x, filters: int, time_distributed: bool = False):
 
 
 def dilated_spatial_pyramid(x, filters: int):
-    """Aggregate spatial context over four receptive-field sizes."""
-    branch_filters = max(filters // 4, 1)
+    """Aggregate local and long-range context with a compact GPU graph."""
+    branch_filters = max(filters // 2, 1)
     branches = [
         layers.Conv2D(
             branch_filters, 3, padding="same", dilation_rate=rate,
             activation="relu",
         )(x)
-        for rate in (1, 2, 4, 8)
+        for rate in (1, 4)
     ]
     x = layers.Concatenate(name="dilated_context")(branches)
     return layers.Conv2D(
@@ -304,29 +304,36 @@ def build_model(sequence_length: int, learning_rate: float,
                 topology_loss: bool = True) -> keras.Model:
     sequence = layers.Input((sequence_length, *IMAGE_SHAPE, 3), name="sequence")
 
-    x = residual_block(sequence, base_filters, time_distributed=True)
-    skip_256 = last_time_step(x, "skip_256")
+    x = layers.TimeDistributed(
+        layers.Conv2D(base_filters, 5, padding="same", activation="relu")
+    )(sequence)
     x = layers.TimeDistributed(layers.MaxPooling2D(2))(x)
-    x = residual_block(x, 2 * base_filters, time_distributed=True)
-    skip_128 = last_time_step(x, "skip_128")
+    x = layers.TimeDistributed(
+        layers.Conv2D(2 * base_filters, 3, padding="same", activation="relu")
+    )(x)
     x = layers.TimeDistributed(layers.MaxPooling2D(2))(x)
-    x = residual_block(x, 4 * base_filters, time_distributed=True)
+    x = layers.TimeDistributed(
+        layers.Conv2D(4 * base_filters, 3, padding="same", activation="relu")
+    )(x)
     skip_64 = last_time_step(x, "skip_64")
     x = layers.TimeDistributed(layers.MaxPooling2D(2))(x)
     x = layers.ConvLSTM2D(
-        8 * base_filters, 3, padding="same", return_sequences=False
+        4 * base_filters, 3, padding="same", return_sequences=False
     )(x)
-    x = dilated_spatial_pyramid(x, 8 * base_filters)
-    x = residual_block(x, 8 * base_filters)
+    x = dilated_spatial_pyramid(x, 4 * base_filters)
     x = layers.UpSampling2D(2)(x)
     x = layers.Concatenate(name="decoder_skip_64")([x, skip_64])
-    x = residual_block(x, 4 * base_filters)
+    x = layers.Conv2D(
+        4 * base_filters, 3, padding="same", activation="relu"
+    )(x)
     x = layers.UpSampling2D(2)(x)
-    x = layers.Concatenate(name="decoder_skip_128")([x, skip_128])
-    x = residual_block(x, 2 * base_filters)
+    x = layers.Conv2D(
+        2 * base_filters, 3, padding="same", activation="relu"
+    )(x)
     x = layers.UpSampling2D(2)(x)
-    x = layers.Concatenate(name="decoder_skip_256")([x, skip_256])
-    x = residual_block(x, base_filters)
+    x = layers.Conv2D(
+        base_filters, 3, padding="same", activation="relu"
+    )(x)
     if target_mode == "crack_strength":
         growth = layers.Conv2D(
             1, 3, padding="same", activation="sigmoid",
