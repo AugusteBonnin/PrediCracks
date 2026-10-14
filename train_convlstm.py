@@ -258,12 +258,31 @@ def build_model(sequence_length: int, learning_rate: float,
     x = layers.UpSampling2D(2)(x)
     x = layers.Concatenate(name="decoder_skip_256")([x, skip_256])
     x = residual_block(x, base_filters)
-    activation = "sigmoid" if target_mode == "crack_strength" else None
-    delta = layers.Conv2D(
-        1, 3, padding="same", activation=activation, name="delta_prediction"
-    )(x)
+    if target_mode == "crack_strength":
+        growth = layers.Conv2D(
+            1, 3, padding="same", activation="sigmoid",
+            name="growth_probability",
+        )(x)
+        last_crack = layers.Lambda(
+            lambda tensor: tensor[:, -1, :, :, :1],
+            output_shape=lambda input_shape: (
+                input_shape[0], input_shape[2], input_shape[3], 1
+            ),
+            name="last_crack_strength",
+        )(sequence)
+        available = layers.Lambda(
+            lambda tensor: 1.0 - tensor,
+            output_shape=lambda input_shape: input_shape,
+            name="available_surface",
+        )(last_crack)
+        growth = layers.Multiply(name="new_crack_growth")([growth, available])
+        prediction = layers.Add(name="crack_prediction")([last_crack, growth])
+    else:
+        prediction = layers.Conv2D(
+            1, 3, padding="same", name="delta_prediction"
+        )(x)
 
-    model = keras.models.Model(sequence, delta, name="crack_delta_convlstm")
+    model = keras.models.Model(sequence, prediction, name="crack_delta_convlstm")
     model.compile(
         optimizer=keras.optimizers.Adam(lr=learning_rate),
         loss=crack_structure_loss if target_mode == "crack_strength" else weighted_delta_loss,
@@ -364,6 +383,10 @@ def main() -> None:
         "validation_samples": int(len(val_samples)),
         "max_horizon": args.max_horizon,
         "output_mode": args.target_mode,
+        "growth_mode": (
+            "additive_monotonic"
+            if args.target_mode == "crack_strength" else "none"
+        ),
         "base_filters": args.base_filters,
         "crack_contrast": args.crack_contrast,
         "delta_scale": args.delta_scale,
