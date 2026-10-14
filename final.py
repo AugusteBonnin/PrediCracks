@@ -108,8 +108,8 @@ class PairedImageGenerator(Sequence):
                 batch_delta_ts.append(delta_t)       # Δt remains the same
                 batch_output_images.append(out_img)
 
-        return [np.array(batch_input_images), 
-                np.array(batch_input_times).reshape(-1, 1), 
+        return [np.array(batch_input_images),
+                np.array(batch_input_times).reshape(-1, 1),
                 np.array(batch_delta_ts).reshape(-1, 1)], np.array(batch_output_images)
 
 # --- Model Creation ---
@@ -148,7 +148,7 @@ def create_model():
     model.compile(optimizer='adam', loss='mse', metrics=['mae'])
 
     return model
-    
+
 model = create_model()
 
 model.summary()
@@ -172,4 +172,3 @@ model.fit_generator(
     validation_steps=len(eval_generator),
     callbacks=callbacks
 )
-

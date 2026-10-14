@@ -51,4 +51,3 @@ while current_time <= 1.0:
     step += 1
 
 print(f"Inference completed. Images saved to {output_directory}.")
-
