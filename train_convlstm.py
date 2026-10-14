@@ -205,8 +205,8 @@ def soft_skeleton(image, iterations: int = 3):
     return skeleton
 
 
-def crack_structure_loss(y_true, y_pred):
-    """Combine pixel balance, overlap, and centerline connectivity."""
+def crack_region_losses(y_true, y_pred):
+    """Return weighted pixel BCE and Dice overlap losses."""
     epsilon = K.epsilon()
     y_pred = K.clip(y_pred, epsilon, 1.0 - epsilon)
 
@@ -223,6 +223,19 @@ def crack_structure_loss(y_true, y_pred):
         K.sum(y_true) + K.sum(y_pred) + epsilon
     )
     dice_loss = 1.0 - dice
+    return binary_crossentropy, dice_loss, y_pred
+
+
+def crack_structure_loss_without_cldice(y_true, y_pred):
+    """GPU-friendly weighted BCE and Dice objective."""
+    binary_crossentropy, dice_loss, _ = crack_region_losses(y_true, y_pred)
+    return (2.0 / 3.0) * binary_crossentropy + (1.0 / 3.0) * dice_loss
+
+
+def crack_structure_loss(y_true, y_pred):
+    """Combine pixel balance, overlap, and centerline connectivity."""
+    epsilon = K.epsilon()
+    binary_crossentropy, dice_loss, y_pred = crack_region_losses(y_true, y_pred)
 
     true_skeleton = soft_skeleton(y_true)
     predicted_skeleton = soft_skeleton(y_pred)
@@ -287,7 +300,8 @@ def last_time_step(x, name: str):
 
 
 def build_model(sequence_length: int, learning_rate: float,
-                target_mode: str = "scaled_delta", base_filters: int = 16) -> keras.Model:
+                target_mode: str = "scaled_delta", base_filters: int = 16,
+                topology_loss: bool = True) -> keras.Model:
     sequence = layers.Input((sequence_length, *IMAGE_SHAPE, 3), name="sequence")
 
     x = residual_block(sequence, base_filters, time_distributed=True)
@@ -338,9 +352,13 @@ def build_model(sequence_length: int, learning_rate: float,
         )(x)
 
     model = keras.models.Model(sequence, prediction, name="crack_delta_convlstm")
+    crack_loss = (
+        crack_structure_loss if topology_loss
+        else crack_structure_loss_without_cldice
+    )
     model.compile(
         optimizer=keras.optimizers.Adam(lr=learning_rate),
-        loss=crack_structure_loss if target_mode == "crack_strength" else weighted_delta_loss,
+        loss=crack_loss if target_mode == "crack_strength" else weighted_delta_loss,
         metrics=["mean_absolute_error"],
     )
     return model
@@ -376,6 +394,10 @@ def parse_args() -> argparse.Namespace:
                         default="scaled_delta")
     parser.add_argument("--base-filters", type=int, default=8)
     parser.add_argument("--crack-contrast", type=float, default=0.25)
+    parser.add_argument(
+        "--no-topology-loss", action="store_true",
+        help="Use weighted BCE + Dice without clDice for older GPU backends.",
+    )
     return parser.parse_args()
 
 
@@ -416,8 +438,10 @@ def main() -> None:
         args.delta_scale, False, False, args.seed,
         args.target_mode,
     )
-    model = build_model(args.sequence_length, args.learning_rate,
-                        args.target_mode, args.base_filters)
+    model = build_model(
+        args.sequence_length, args.learning_rate, args.target_mode,
+        args.base_filters, not args.no_topology_loss,
+    )
     if args.initial_weights is not None:
         if not args.initial_weights.exists():
             raise ValueError(f"Initial weights not found: {args.initial_weights}")
@@ -442,6 +466,7 @@ def main() -> None:
             "additive_monotonic"
             if args.target_mode == "crack_strength" else "none"
         ),
+        "topology_loss": not args.no_topology_loss,
         "base_filters": args.base_filters,
         "crack_contrast": args.crack_contrast,
         "delta_scale": args.delta_scale,
