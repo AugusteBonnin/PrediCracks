@@ -222,15 +222,27 @@ def dilated_spatial_pyramid(x, filters: int):
     )(x)
 
 
+def last_time_step(x, name: str):
+    """Select encoder features aligned with the most recent input frame."""
+    return layers.Lambda(
+        lambda tensor: tensor[:, -1],
+        output_shape=lambda input_shape: (input_shape[0],) + input_shape[2:],
+        name=name,
+    )(x)
+
+
 def build_model(sequence_length: int, learning_rate: float,
                 target_mode: str = "scaled_delta", base_filters: int = 16) -> keras.Model:
     sequence = layers.Input((sequence_length, *IMAGE_SHAPE, 3), name="sequence")
 
     x = residual_block(sequence, base_filters, time_distributed=True)
+    skip_256 = last_time_step(x, "skip_256")
     x = layers.TimeDistributed(layers.MaxPooling2D(2))(x)
     x = residual_block(x, 2 * base_filters, time_distributed=True)
+    skip_128 = last_time_step(x, "skip_128")
     x = layers.TimeDistributed(layers.MaxPooling2D(2))(x)
     x = residual_block(x, 4 * base_filters, time_distributed=True)
+    skip_64 = last_time_step(x, "skip_64")
     x = layers.TimeDistributed(layers.MaxPooling2D(2))(x)
     x = layers.ConvLSTM2D(
         8 * base_filters, 3, padding="same", return_sequences=False
@@ -238,10 +250,13 @@ def build_model(sequence_length: int, learning_rate: float,
     x = dilated_spatial_pyramid(x, 8 * base_filters)
     x = residual_block(x, 8 * base_filters)
     x = layers.UpSampling2D(2)(x)
+    x = layers.Concatenate(name="decoder_skip_64")([x, skip_64])
     x = residual_block(x, 4 * base_filters)
     x = layers.UpSampling2D(2)(x)
+    x = layers.Concatenate(name="decoder_skip_128")([x, skip_128])
     x = residual_block(x, 2 * base_filters)
     x = layers.UpSampling2D(2)(x)
+    x = layers.Concatenate(name="decoder_skip_256")([x, skip_256])
     x = residual_block(x, base_filters)
     activation = "sigmoid" if target_mode == "crack_strength" else None
     delta = layers.Conv2D(
