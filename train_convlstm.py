@@ -176,17 +176,72 @@ def weighted_delta_loss(y_true, y_pred):
     return K.mean(pixel_loss) + 0.5 * gradient_loss
 
 
-def crack_structure_loss(y_true, y_pred):
-    """Fit crack interiors and, especially, their thin spatial boundaries."""
-    pixel_loss = (1.0 + 6.0 * y_true) * K.square(y_pred - y_true)
-    true_dx = y_true[:, :, 1:, :] - y_true[:, :, :-1, :]
-    pred_dx = y_pred[:, :, 1:, :] - y_pred[:, :, :-1, :]
-    true_dy = y_true[:, 1:, :, :] - y_true[:, :-1, :, :]
-    pred_dy = y_pred[:, 1:, :, :] - y_pred[:, :-1, :, :]
-    gradient_loss = K.mean(K.abs(pred_dx - true_dx)) + K.mean(
-        K.abs(pred_dy - true_dy)
+def soft_erode(image):
+    """Differentiable approximation of binary erosion for thin structures."""
+    vertical = -K.pool2d(
+        -image, (3, 1), strides=(1, 1), padding="same", pool_mode="max"
     )
-    return K.mean(pixel_loss) + gradient_loss
+    horizontal = -K.pool2d(
+        -image, (1, 3), strides=(1, 1), padding="same", pool_mode="max"
+    )
+    return K.minimum(vertical, horizontal)
+
+
+def soft_dilate(image):
+    return K.pool2d(
+        image, (3, 3), strides=(1, 1), padding="same", pool_mode="max"
+    )
+
+
+def soft_skeleton(image, iterations: int = 10):
+    """Extract a differentiable centerline with iterative morphology."""
+    opened = soft_dilate(soft_erode(image))
+    skeleton = K.relu(image - opened)
+    for _ in range(iterations):
+        image = soft_erode(image)
+        opened = soft_dilate(soft_erode(image))
+        delta = K.relu(image - opened)
+        skeleton = skeleton + K.relu(delta - skeleton * delta)
+    return skeleton
+
+
+def crack_structure_loss(y_true, y_pred):
+    """Combine pixel balance, overlap, and centerline connectivity."""
+    epsilon = K.epsilon()
+    y_pred = K.clip(y_pred, epsilon, 1.0 - epsilon)
+
+    pixel_weights = 1.0 + 6.0 * y_true
+    binary_crossentropy = -K.mean(
+        pixel_weights * (
+            y_true * K.log(y_pred)
+            + (1.0 - y_true) * K.log(1.0 - y_pred)
+        )
+    )
+
+    intersection = K.sum(y_true * y_pred)
+    dice = (2.0 * intersection + epsilon) / (
+        K.sum(y_true) + K.sum(y_pred) + epsilon
+    )
+    dice_loss = 1.0 - dice
+
+    true_skeleton = soft_skeleton(y_true)
+    predicted_skeleton = soft_skeleton(y_pred)
+    topology_precision = (
+        K.sum(predicted_skeleton * y_true) + epsilon
+    ) / (K.sum(predicted_skeleton) + epsilon)
+    topology_sensitivity = (
+        K.sum(true_skeleton * y_pred) + epsilon
+    ) / (K.sum(true_skeleton) + epsilon)
+    cldice = (
+        2.0 * topology_precision * topology_sensitivity + epsilon
+    ) / (topology_precision + topology_sensitivity + epsilon)
+    cldice_loss = 1.0 - cldice
+
+    return (
+        0.5 * binary_crossentropy
+        + 0.25 * dice_loss
+        + 0.25 * cldice_loss
+    )
 
 
 def residual_block(x, filters: int, time_distributed: bool = False):
